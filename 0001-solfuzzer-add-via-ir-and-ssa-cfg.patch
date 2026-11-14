@@ -1,0 +1,162 @@
+From 5e9f876b072feab35d0b6ba6099717d667b9b946 Mon Sep 17 00:00:00 2001
+From: Alex Groce <agroce@gmail.com>
+Date: Fri, 13 Nov 2026 16:47:32 -0700
+Subject: [PATCH] solfuzzer: add --via-ir and --ssa-cfg
+
+solfuzzer only compiled through the legacy pipeline: it requests all
+outputs with "*", which deliberately does not match the IR outputs, and
+never sets viaIR, so whole-program fuzzing never reached IR code
+generation. --via-ir sets settings.viaIR; --ssa-cfg additionally sets
+settings.experimental and settings.viaSSACFG. Default behaviour is
+unchanged. The options are rejected with --standard-json and --const-opt.
+
+Checked under gdb on a small contract: IRGenerator::run is reached only
+with --via-ir/--ssa-cfg, and yul::ssa::CodeTransform::run only with
+--ssa-cfg.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016GhCbJFykxoRhRPSyRM1Va
+---
+ docs/contributing.rst        | 10 ++++++++++
+ test/tools/afl_fuzzer.cpp    | 19 ++++++++++++++++++-
+ test/tools/fuzzer_common.cpp | 20 ++++++++++++++++++--
+ test/tools/fuzzer_common.h   | 11 ++++++++++-
+ 4 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/docs/contributing.rst b/docs/contributing.rst
+index b44e339..cd6e3ea 100644
+--- a/docs/contributing.rst
++++ b/docs/contributing.rst
+@@ -434,6 +434,16 @@ Now run the fuzzer (the ``-m`` extends the size of memory to 60 MB):
+ 
+     afl-fuzz -m 60 -i /tmp/test_cases -o /tmp/fuzzer_reports -- /path/to/solfuzzer
+ 
++By default, ``solfuzzer`` compiles through the legacy code generator. To fuzz compilation
++via the Yul IR pipeline instead, pass ``--via-ir``; ``--ssa-cfg`` additionally uses the
++experimental SSA CFG code generator. Several AFL instances fuzzing different pipelines can
++share one output directory, so that inputs found by one are also tried by the others:
++
++.. code-block:: bash
++
++    afl-fuzz -M legacy -i /tmp/test_cases -o /tmp/fuzzer_reports -- /path/to/solfuzzer
++    afl-fuzz -S viair -i /tmp/test_cases -o /tmp/fuzzer_reports -- /path/to/solfuzzer --via-ir
++
+ The fuzzer creates source files that lead to failures in ``/tmp/fuzzer_reports``.
+ Often it finds many similar source files that produce the same error. You can
+ use the tool ``scripts/uniqueErrors.sh`` to filter out the unique errors.
+diff --git a/test/tools/afl_fuzzer.cpp b/test/tools/afl_fuzzer.cpp
+index bac98d7..f7a8192 100644
+--- a/test/tools/afl_fuzzer.cpp
++++ b/test/tools/afl_fuzzer.cpp
+@@ -69,6 +69,15 @@ Allowed options)",
+ 		(
+ 			"without-optimizer",
+ 			"Run without optimizations. Cannot be used together with standard-json."
++		)
++		(
++			"via-ir",
++			"Compile via the Yul IR pipeline. Cannot be used together with standard-json or const-opt."
++		)
++		(
++			"ssa-cfg",
++			"Compile via IR with the experimental SSA CFG code generator (implies --via-ir). "
++			"Cannot be used together with standard-json or const-opt."
+ 		);
+ 
+ 	// All positional options should be interpreted as input files
+@@ -107,6 +116,13 @@ Allowed options)",
+ 		inputs.emplace_back("");
+ 
+ 	bool optimize = !arguments.count("without-optimizer");
++	bool viaSSACFG = arguments.count("ssa-cfg") > 0;
++	bool viaIR = viaSSACFG || arguments.count("via-ir") > 0;
++	if ((viaIR || viaSSACFG) && (arguments.count("standard-json") || arguments.count("const-opt")))
++	{
++		std::cerr << "--via-ir and --ssa-cfg cannot be used together with --standard-json or --const-opt." << std::endl;
++		return 1;
++	}
+ 	int retResult = 0;
+ 
+ 	for (std::string const& inputFile: inputs)
+@@ -124,7 +140,7 @@ Allowed options)",
+ 			else if (arguments.count("standard-json"))
+ 				FuzzerUtil::testStandardCompiler(input, quiet);
+ 			else
+-				FuzzerUtil::testCompilerJsonInterface(input, optimize, quiet);
++				FuzzerUtil::testCompilerJsonInterface(input, optimize, quiet, viaIR, viaSSACFG);
+ 		}
+ 		catch (...)
+ 		{
+@@ -135,6 +151,7 @@ Allowed options)",
+ 
+ 			std::cerr << "Fuzzer "
+ 				<< (optimize ? "" : "(without optimizer) ")
++				<< (viaSSACFG ? "(via SSA CFG) " : (viaIR ? "(via IR) " : ""))
+ 				<< "failed on "
+ 				<< inputFile;
+ 		}
+diff --git a/test/tools/fuzzer_common.cpp b/test/tools/fuzzer_common.cpp
+index d3da086..ec39dc3 100644
+--- a/test/tools/fuzzer_common.cpp
++++ b/test/tools/fuzzer_common.cpp
+@@ -41,10 +41,19 @@ using namespace solidity::util;
+ 
+ static auto constexpr s_evmVersions = EVMVersion::allVersions();
+ 
+-void FuzzerUtil::testCompilerJsonInterface(std::string const& _input, bool _optimize, bool _quiet)
++void FuzzerUtil::testCompilerJsonInterface(
++	std::string const& _input,
++	bool _optimize,
++	bool _quiet,
++	bool _viaIR,
++	bool _viaSSACFG
++)
+ {
+ 	if (!_quiet)
+-		std::cout << "Testing compiler " << (_optimize ? "with" : "without") << " optimizer." << std::endl;
++		std::cout
++			<< "Testing compiler " << (_optimize ? "with" : "without") << " optimizer"
++			<< (_viaSSACFG ? " via SSA CFG" : (_viaIR ? " via IR" : ""))
++			<< "." << std::endl;
+ 
+ 	Json config;
+ 	config["language"] = "Solidity";
+@@ -56,6 +65,13 @@ void FuzzerUtil::testCompilerJsonInterface(std::string const& _input, bool _opti
+ 	config["settings"]["optimizer"]["enabled"] = _optimize;
+ 	config["settings"]["optimizer"]["runs"] = static_cast<int>(OptimiserSettings{}.expectedExecutionsPerDeployment);
+ 	config["settings"]["evmVersion"] = "berlin";
++	if (_viaIR || _viaSSACFG)
++		config["settings"]["viaIR"] = true;
++	if (_viaSSACFG)
++	{
++		config["settings"]["experimental"] = true;
++		config["settings"]["viaSSACFG"] = true;
++	}
+ 
+ 	// Enable all SourceUnit-level outputs.
+ 	config["settings"]["outputSelection"]["*"][""][0] = "*";
+diff --git a/test/tools/fuzzer_common.h b/test/tools/fuzzer_common.h
+index 6da501d..5abf7df 100644
+--- a/test/tools/fuzzer_common.h
++++ b/test/tools/fuzzer_common.h
+@@ -28,7 +28,16 @@
+ struct FuzzerUtil
+ {
+ 	static void runCompiler(std::string const& _input, bool _quiet);
+-	static void testCompilerJsonInterface(std::string const& _input, bool _optimize, bool _quiet);
++	/// Compiles @a _input via the standard JSON interface, requesting all outputs.
++	/// @a _viaIR compiles via the Yul IR pipeline; @a _viaSSACFG additionally uses
++	/// the (experimental) SSA CFG code generator, and implies @a _viaIR.
++	static void testCompilerJsonInterface(
++		std::string const& _input,
++		bool _optimize,
++		bool _quiet,
++		bool _viaIR = false,
++		bool _viaSSACFG = false
++	);
+ 	static void testConstantOptimizer(std::string const& _input, bool _quiet);
+ 	static void testStandardCompiler(std::string const& _input, bool _quiet);
+ 	/// Compiles @param _input which is a map of input file name to source code
+-- 
+2.43.0
+
