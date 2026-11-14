@@ -29,14 +29,7 @@ while depth < 20:
             if r != 0:
                 print(tname, "FAILED OR TIMED OUT!")
                 os.remove(sys.argv[1] + "/" + tname)
-        if "pragma experimental ABIEncoderV2" not in d:
-            tname = fname.replace(".sol", "_ABIV2.sol")
-            with open(sys.argv[1] + "/" + tname, 'w') as outf:
-                outf.write("pragma experimental ABIEncoderV2;\n")
-                outf.write(d)
-            r = subprocess.call(["ulimit -t 5; ../build/test/tools/solfuzzer " + sys.argv[1] + "/" + tname], shell=True, stdout=dnull, stderr=dnull)
-            if r != 0:
-                print(tname, "FAILED OR TIMED OUT!")                
-                os.remove(sys.argv[1] + "/" + tname)            
+        # No ABIEncoderV2 variant: ABI coder v2 is the default since Solidity 0.8.0,
+        # so "pragma experimental ABIEncoderV2" only adds a deprecation warning.
     path = "*/" + path
                                                  
